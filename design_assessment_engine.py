@@ -22,6 +22,7 @@ LOW_CONFIDENCE_CODE_LLT_DESCRIPTIONS = {
     "SUTURES ARE TOO LOOSE",
     "WILL NOT ROTATE",
 }
+
 TEXT_COLUMNS = [
     "Product Description – PE PLI",
     "Brief Description – PE",
@@ -60,15 +61,23 @@ RULE_PATTERNS = {
     ],
 }
 EXCLUSION_PATTERNS = [r"\bstandard software analysis\b"]
+
+
 def _normalize_text(value: Any) -> str:
+    """Normalize free text for case-insensitive rule matching."""
     return re.sub(r"\s+", " ", str(value or "").strip()).upper()
+
+
 def low_confidence_code_llt_reason(row: pd.Series) -> str:
+    """Return a low-confidence rule reason when Code/LLT and Complaint? match."""
     complaint = _normalize_text(row.get("Complaint? – PE", ""))
     if complaint not in {"Y", "YES", "TRUE"}:
         return ""
+
     code_llt = _normalize_text(row.get("Code/LLT Desc – PE PLI", ""))
     if not code_llt:
         return ""
+
     matched = [
         desc
         for desc in sorted(LOW_CONFIDENCE_CODE_LLT_DESCRIPTIONS)
@@ -77,6 +86,7 @@ def low_confidence_code_llt_reason(row: pd.Series) -> str:
     if not matched:
         return ""
     return "Low-confidence Code/LLT complaint rule: " + "; ".join(matched)
+
 KEY_EXPORT_COLUMNS = [
     "Product Event ID", "PE - PLI #", "Decision", "Type - PE PLI Task", "Model DA Probability",
     "DA Triage Tier", "Recommended DA Action", "Tiered DA Reason", "Product Description – PE PLI",

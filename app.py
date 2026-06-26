@@ -1,14 +1,21 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from design_assessment_engine import (
     read_input_file,
     score_dataframe,
     load_model,
     to_excel_bytes,
     summarize_scored,
+    clean_df,
+    build_text,
+    MANDATORY_DECISIONS,
     HIGH_CONFIDENCE_THRESHOLD,
     WATCHLIST_THRESHOLD,
 )
+from sklearn.model_selection import GroupShuffleSplit
+from joblib import Parallel, delayed
+from train_model import evaluate_split, make_groups, aggregate_validation_runs
 
 st.set_page_config(page_title="Design Assessment Tiered Screener", layout="wide")
 st.title("Design Assessment Tiered Screener")
@@ -95,6 +102,75 @@ def show_validation_results(metrics: dict) -> None:
 
         st.caption(metrics.get("validation_method", "Validation metrics"))
 
+@st.cache_data(show_spinner=False)
+def run_uploaded_rotated_validation(
+    raw_df: pd.DataFrame,
+    high_threshold: float,
+    watch_threshold: float,
+    train_size: float = 0.70,
+    random_state: int = 42,
+    group_column: str = "PE - PLI #",
+    rotation_runs: int = 3,
+    n_jobs: int = 3,
+) -> tuple[list[dict], dict]:
+    df = clean_df(raw_df)
+    groups = make_groups(df, group_column)
+    if len(pd.unique(groups)) < 2:
+        raise ValueError(f"{group_column!r} must produce at least two groups")
+
+    X = build_text(df)
+    mandatory = df["Decision"].isin(MANDATORY_DECISIONS).to_numpy()
+    y_hist = (df["Type - PE PLI Task"].str.lower() == "design assessment").astype(int).to_numpy()
+    y_corrected = np.where(mandatory, 1, y_hist).astype(int)
+    splitter = GroupShuffleSplit(n_splits=rotation_runs, train_size=train_size, random_state=random_state)
+    splits = list(splitter.split(X, y_corrected, groups=groups))
+
+    def run_rotation(run_number: int, train_idx, test_idx) -> dict:
+        run = evaluate_split(
+            df,
+            X,
+            y_hist,
+            mandatory,
+            train_idx,
+            test_idx,
+            random_state + run_number,
+            high_threshold,
+            watch_threshold,
+        )
+        run["run"] = run_number
+        return run
+
+    runs = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(run_rotation)(run_number, train_idx, test_idx)
+        for run_number, (train_idx, test_idx) in enumerate(splits, start=1)
+    )
+    summary = aggregate_validation_runs(runs, groups)
+    rows = [
+        _scorecard_row(f"Uploaded rotation {run.get('run')}", run.get("test_summary", {}).get("review_queue_scorecard", {}))
+        for run in runs
+    ]
+    combined = _combined_scorecard_row("Uploaded rotations combined", summary, "review_queue_scorecard")
+    if combined:
+        rows.append(combined)
+    return rows, summary
+
+def show_uploaded_rotation_results(df: pd.DataFrame, high_threshold: float, watch_threshold: float) -> None:
+    if "Decision" not in df.columns or "Type - PE PLI Task" not in df.columns:
+        st.info("Upload includes no validation labels, so rotated validation cannot be calculated for this file.")
+        return
+
+    try:
+        with st.spinner("Running 3 rotated 70/30 validations on the uploaded file..."):
+            rows, _summary = run_uploaded_rotated_validation(df, high_threshold, watch_threshold)
+    except Exception as e:
+        st.warning(f"Could not calculate uploaded-file rotated validation: {e}")
+        return
+
+    if rows:
+        st.subheader("Uploaded file rotated 70/30 validation")
+        st.caption("Each row trains on a random grouped 70% of the uploaded file and predicts a different grouped 30%; the combined row summarizes all three prediction sets.")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 payload = load_model("design_assessment_model.joblib")
 metrics = payload.get("metrics", {})
@@ -124,6 +200,7 @@ except Exception as e:
 
 summary = summarize_scored(scored)
 st.success(f"Scored {len(scored):,} rows")
+show_uploaded_rotation_results(df, high_threshold, watch_threshold)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("DA REQUIRED", f"{summary['tier_counts'].get('DA REQUIRED', 0):,}")

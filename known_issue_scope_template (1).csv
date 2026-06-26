@@ -1,0 +1,2 @@
+Issue_ID,Issue_Name,Product_Contains,Failure_Code_Contains,In_Scope_Models,Out_Of_Scope_Models,Software_Versions_In_Scope,Lots_In_Scope,Further_Action_ID,Notes
+EXAMPLE-001,Previously investigated jaw opening issue,EGIA,JAWS WILL NOT OPEN,EGIA60AVM,,,,FA-####,Populate this table to automate prior action / scope mismatch checks.

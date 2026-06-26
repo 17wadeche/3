@@ -12,6 +12,16 @@ import joblib
 MANDATORY_DECISIONS = {"Death - Reportable", "Serious Injury - Reportable"}
 HIGH_CONFIDENCE_THRESHOLD = 0.60
 WATCHLIST_THRESHOLD = 0.0485
+LOW_CONFIDENCE_CODE_LLT_DESCRIPTIONS = {
+    "ARTICULATION INSUFFICIENT",
+    "CLIP APPLIER DID NOT FIRE",
+    "CORD/CABLE FAILURE/DAMAGE",
+    "DEVICE MISSING BARBS",
+    "SIGNIA ADAPTER SLOW TO RECOGNIZE",
+    "SUTURE APPEARANCE",
+    "SUTURES ARE TOO LOOSE",
+    "WILL NOT ROTATE",
+}
 
 TEXT_COLUMNS = [
     "Product Description – PE PLI",
@@ -52,6 +62,31 @@ RULE_PATTERNS = {
 }
 
 EXCLUSION_PATTERNS = [r"\bstandard software analysis\b"]
+
+
+def _normalize_text(value: Any) -> str:
+    """Normalize free text for case-insensitive rule matching."""
+    return re.sub(r"\s+", " ", str(value or "").strip()).upper()
+
+
+def low_confidence_code_llt_reason(row: pd.Series) -> str:
+    """Return a low-confidence rule reason when Code/LLT and Complaint? match."""
+    complaint = _normalize_text(row.get("Complaint? – PE", ""))
+    if complaint not in {"Y", "YES", "TRUE"}:
+        return ""
+
+    code_llt = _normalize_text(row.get("Code/LLT Desc – PE PLI", ""))
+    if not code_llt:
+        return ""
+
+    matched = [
+        desc
+        for desc in sorted(LOW_CONFIDENCE_CODE_LLT_DESCRIPTIONS)
+        if desc in code_llt
+    ]
+    if not matched:
+        return ""
+    return "Low-confidence Code/LLT complaint rule: " + "; ".join(matched)
 
 KEY_EXPORT_COLUMNS = [
     "Product Event ID", "PE - PLI #", "Decision", "Type - PE PLI Task", "Model DA Probability",
@@ -151,6 +186,13 @@ def score_dataframe(
     rule_results = [rule_score_text(t) for t in X]
     rule_signal = np.array([x[0] for x in rule_results], dtype=int)
     rule_reason = [x[1] for x in rule_results]
+    low_confidence_reasons = [low_confidence_code_llt_reason(row) for _, row in df.iterrows()]
+    low_confidence_signal = np.array([1 if reason else 0 for reason in low_confidence_reasons], dtype=int)
+    rule_signal = np.maximum(rule_signal, low_confidence_signal)
+    rule_reason = [
+        "; ".join(part for part in [base_reason, low_confidence_reason] if part)
+        for base_reason, low_confidence_reason in zip(rule_reason, low_confidence_reasons)
+    ]
     exclusion = (df["Decision"].str.lower() == "not a complaint") | (df["Complaint? – PE"].str.upper().isin(["N", "NO", "FALSE"]))
 
     tier: list[str] = []
@@ -176,6 +218,12 @@ def score_dataframe(
             review_queue_flag.append(0); broad_attention_flag.append(0); sort_order.append(4)
             action.append("No DA triage flag unless reviewer identifies new device/software issue")
             reason.append("Exclusion: not a complaint unless mandatory Decision applies")
+        elif low_confidence_signal[i] == 1:
+            tier.append("DA WATCHLIST - LOW CONFIDENCE")
+            required_flag.append(0); high_flag.append(0); watch_flag.append(1)
+            review_queue_flag.append(0); broad_attention_flag.append(1); sort_order.append(3)
+            action.append("Watchlist/trending review; not a required DA without reviewer confirmation")
+            reason.append(low_confidence_reasons[i])
         elif probs[i] >= high_threshold:
             tier.append("DA REVIEW - HIGH CONFIDENCE")
             required_flag.append(0); high_flag.append(1); watch_flag.append(0)

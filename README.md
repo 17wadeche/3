@@ -17,6 +17,7 @@ The output is now split into three actionable levels instead of one broad review
 
 3. **DA WATCHLIST - LOW CONFIDENCE**
    - Rows with a definition text signal or model probability at or above the watchlist threshold.
+   - Complaint rows (`Complaint? – PE = Y`) whose `Code/LLT Desc – PE PLI` contains any configured low-confidence Code/LLT complaint rule, such as `ARTICULATION INSUFFICIENT`, `CLIP APPLIER DID NOT FIRE`, `CORD/CABLE FAILURE/DAMAGE`, `DEVICE MISSING BARBS`, `SIGNIA ADAPTER SLOW TO RECOGNIZE`, `SUTURE APPEARANCE`, `SUTURES ARE TOO LOOSE`, or `WILL NOT ROTATE`.
    - Default threshold: `0.0485`.
    - These are for trending, sampling, or a second look. They are not automatic Design Assessments.
 
@@ -49,23 +50,30 @@ python score_file.py "input.xlsx" --high-threshold 0.60 --watchlist-threshold 0.
 python train_model.py "historical_data.xlsx" --output design_assessment_model.joblib
 ```
 
-Default behavior now randomly splits the historical file by **Product Event ID group**:
+Default behavior now randomly splits the historical file by **PE - PLI # group**:
 
-- 70% of grouped events are used to train the model.
+- 70% of grouped PE - PLI #s are used to train the model.
 - The remaining 30% are held out for testing.
-- Rows from the same Product Event ID stay together, so the same event does not leak into both train and test.
+- Rows from the same PE - PLI # stay together, so the same PLI does not leak into both train and test.
 - Mandatory `Death - Reportable` and `Serious Injury - Reportable` rules are applied during validation, but the model itself trains only on non-mandatory rows.
+- The metrics also include repeated grouped 70/30 holdouts and grouped k-fold validation, so the reported result is less dependent on one lucky or unlucky split.
 
 Outputs from retraining:
 
 - `design_assessment_model.joblib` — saved model package
-- `model_metrics.json` — true holdout validation metrics
+- `model_metrics.json` — true holdout validation metrics, repeated validation summaries, and per-run/fold details
 - `validation_holdout_scored.xlsx` — the 30% test set scored by the tool
 
 Use a different random split or percentage if needed:
 
 ```bash
 python train_model.py "historical_data.xlsx" --train-size 0.70 --random-state 123
+```
+
+Change the grouping column or the number of repeated validation runs/folds if needed:
+
+```bash
+python train_model.py "historical_data.xlsx" --group-column "PE - PLI #" --cv-repeats 10 --cv-folds 5
 ```
 
 For final production after you are satisfied with validation, you can validate on 70/30 and then save a model refit on all non-mandatory historical rows:

@@ -148,6 +148,106 @@ def evaluate_split(
     X_test_nm = [X[i] for i in np.where(test_nonmand_mask)[0]]
     y_test_nm = y_hist[test_nonmand_mask]
     probs_nm = model.predict_proba(X_test_nm)[:, 1] if len(X_test_nm) else np.array([])
+    
+    return {
+        "model": model,
+        "train_mask": train_mask,
+        "test_mask": test_mask,
+        "model_train_mask": model_train_mask,
+        "scored_test": scored_test,
+        "test_summary": test_summary,
+        "nonmandatory_model_only": {
+            "test_rows": int(len(y_test_nm)),
+            "test_positive_rows": int(y_test_nm.sum()) if len(y_test_nm) else 0,
+            "average_precision": safe_average_precision(y_test_nm, probs_nm) if len(y_test_nm) else None,
+            "roc_auc": safe_roc_auc(y_test_nm, probs_nm) if len(y_test_nm) else None,
+            "thresholds": {
+                str(high_threshold): threshold_metrics(y_test_nm, probs_nm, high_threshold) if len(y_test_nm) else {},
+                str(watch_threshold): threshold_metrics(y_test_nm, probs_nm, watch_threshold) if len(y_test_nm) else {},
+            },
+        },
+    }
+
+
+def _mean_std(values: list[float]) -> dict:
+    if not values:
+        return {"mean": None, "std": None, "min": None, "max": None}
+    arr = np.array(values, dtype=float)
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=0)),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+    }
+
+
+def aggregate_validation_runs(runs: list[dict]) -> dict:
+    out = {"runs": len(runs)}
+    for scorecard_name in ["review_queue_scorecard", "broad_attention_scorecard"]:
+        metric_values: dict[str, list[float]] = {k: [] for k in ["accuracy", "precision", "recall", "f1"]}
+        count_values: dict[str, int] = {k: 0 for k in ["tp", "fp", "fn", "tn"]}
+        for run in runs:
+            scorecard = run["test_summary"].get(scorecard_name, {})
+            for metric in metric_values:
+                if metric in scorecard:
+                    metric_values[metric].append(float(scorecard[metric]))
+            for count in count_values:
+                count_values[count] += int(scorecard.get(count, 0))
+        out[scorecard_name] = {
+            **{metric: _mean_std(values) for metric, values in metric_values.items()},
+            "total_counts": count_values,
+        }
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Retrain and validate the Design Assessment tiered triage model.")
+    parser.add_argument("input", help="Historical .xlsx/.csv file")
+    parser.add_argument("--output", default="design_assessment_model.joblib", help="Output model .joblib")
+    parser.add_argument("--metrics-output", default="model_metrics.json", help="Validation metrics JSON output")
+    parser.add_argument("--split-output", default="validation_holdout_scored.xlsx", help="Scored test-set workbook output")
+    parser.add_argument("--train-size", type=float, default=0.70, help="Random training share. Default: 0.70")
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed for repeatable splits. Default: 42")
+    parser.add_argument("--group-column", default="PE - PLI #", help="Column used to keep related rows together across train/test splits. Default: PE - PLI #")
+    parser.add_argument("--cv-repeats", type=int, default=10, help="Number of repeated grouped 70/30 validations to run for all-inclusive metrics. Default: 10")
+    parser.add_argument("--cv-folds", type=int, default=5, help="Number of grouped cross-validation folds to run for all-inclusive metrics. Default: 5")
+    parser.add_argument("--high-threshold", type=float, default=HIGH_CONFIDENCE_THRESHOLD)
+    parser.add_argument("--watchlist-threshold", type=float, default=WATCHLIST_THRESHOLD)
+    parser.add_argument("--fit-final-on-all", action="store_true", help="After measuring the 70/30 holdout, refit the saved model on all non-mandatory rows. Leave off when you want the saved model to be the 70%% training model.")
+    args = parser.parse_args()
+
+    if not 0.0485 <= args.train_size <= 0.95:
+        raise ValueError("--train-size must be between 0.0485 and 0.95")
+
+    df = clean_df(read_source(args.input))
+    X = build_text(df)
+    mandatory = df["Decision"].isin(MANDATORY_DECISIONS).to_numpy()
+    y_hist = (df["Type - PE PLI Task"].str.lower() == "design assessment").astype(int).to_numpy()
+    y_corrected = np.where(mandatory, 1, y_hist).astype(int)
+    groups = make_groups(df, args.group_column)
+    unique_group_count = len(np.unique(groups))
+    if unique_group_count < 2:
+        raise ValueError(f"--group-column {args.group_column!r} must produce at least two groups")
+
+    splitter = GroupShuffleSplit(n_splits=1, train_size=args.train_size, random_state=args.random_state)
+    train_idx, test_idx = next(splitter.split(X, y_corrected, groups=groups))
+    holdout = evaluate_split(
+        df,
+        X,
+        y_hist,
+        mandatory,
+        train_idx,
+        test_idx,
+        args.random_state,
+        args.high_threshold,
+        args.watchlist_threshold,
+    )
+    model = holdout["model"]
+    train_mask = holdout["train_mask"]
+    test_mask = holdout["test_mask"]
+    model_train_mask = holdout["model_train_mask"]
+    scored_test = holdout["scored_test"]
+    test_summary = holdout["test_summary"]
 
     return {
         "model": model,

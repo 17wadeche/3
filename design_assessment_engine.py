@@ -60,7 +60,6 @@ RULE_PATTERNS = {
         r"\brecall\b", r"\bcapa\b", r"\bsame failure mode\b", r"\bprevious action\b",
     ],
 }
-
 EXCLUSION_PATTERNS = [r"\bstandard software analysis\b"]
 
 
@@ -93,7 +92,6 @@ KEY_EXPORT_COLUMNS = [
     "DA Triage Tier", "Recommended DA Action", "Tiered DA Reason", "Product Description – PE PLI",
     "Brief Description – PE", "Event Description – PE", "Event Context – PE", "Text Rule Reason",
 ]
-
 
 def read_input_file(file_or_path: Any) -> pd.DataFrame:
     """Read a CSV/XLSX export. Handles normal headers and PowerBI-style row-4 headers."""

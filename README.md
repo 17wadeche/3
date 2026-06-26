@@ -56,13 +56,14 @@ Default behavior now randomly splits the historical file by **PE - PLI # group**
 - The remaining 30% are held out for testing.
 - Rows from the same PE - PLI # stay together, so the same PLI does not leak into both train and test.
 - Mandatory `Death - Reportable` and `Serious Injury - Reportable` rules are applied during validation, but the model itself trains only on non-mandatory rows.
-- The metrics also include repeated grouped 70/30 holdouts and grouped k-fold validation, so the reported result is less dependent on one lucky or unlucky split.
+- The metrics also include 3 simultaneous rotated grouped 70/30 holdouts, repeated grouped 70/30 holdouts, and grouped k-fold validation, so the reported result is less dependent on one lucky or unlucky split.
 
 Outputs from retraining:
 
 - `design_assessment_model.joblib` — saved model package
 - `model_metrics.json` — true holdout validation metrics, repeated validation summaries, and per-run/fold details
-- `validation_holdout_scored.xlsx` — the 30% test set scored by the tool
+- `validation_holdout_scored.xlsx` — the first 30% test set scored by the tool
+- `validation_rotations_scored.xlsx` — each rotated 30% prediction set on its own sheet, plus a `combined` sheet with all rotated predictions together
 
 Use a different random split or percentage if needed:
 
@@ -70,10 +71,16 @@ Use a different random split or percentage if needed:
 python train_model.py "historical_data.xlsx" --train-size 0.70 --random-state 123
 ```
 
-Change the grouping column or the number of repeated validation runs/folds if needed:
+Run exactly the 3-way rotated 70/30 validation view with each prediction set and a combined sheet:
 
 ```bash
-python train_model.py "historical_data.xlsx" --group-column "PE - PLI #" --cv-repeats 10 --cv-folds 5
+python train_model.py "historical_data.xlsx" --rotation-runs 3 --n-jobs 3
+```
+
+Change the grouping column or the number of rotated/repeated validation runs/folds if needed:
+
+```bash
+python train_model.py "historical_data.xlsx" --group-column "PE - PLI #" --rotation-runs 3 --cv-repeats 10 --cv-folds 5
 ```
 
 For final production after you are satisfied with validation, you can validate on 70/30 and then save a model refit on all non-mandatory historical rows:

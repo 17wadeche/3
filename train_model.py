@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import joblib
+from joblib import Parallel, delayed
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
 from sklearn.pipeline import Pipeline
@@ -44,7 +45,7 @@ def make_groups(df: pd.DataFrame, group_column: str = "PE - PLI #") -> np.ndarra
     return groups
 def threshold_metrics(y_true, probs, threshold):
     pred = probs >= threshold
-    p, r, f, _ = precision_recall_fscore_support(y_true, pred, average="binary", zero_division="0")
+    p, r, f, _ = precision_recall_fscore_support(y_true, pred, average="binary", zero_division=0)
     tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
     return {
         "precision": float(p),
@@ -197,6 +198,9 @@ def main():
     parser.add_argument("--train-size", type=float, default=0.70, help="Random training share. Default: 0.70")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed for repeatable splits. Default: 42")
     parser.add_argument("--group-column", default="PE - PLI #", help="Column used to keep related rows together across train/test splits. Default: PE - PLI #")
+    parser.add_argument("--rotation-runs", type=int, default=3, help="Number of rotated grouped 70/30 validation runs to execute and report individually. Default: 3")
+    parser.add_argument("--rotation-output", default="validation_rotations_scored.xlsx", help="Workbook containing each rotated 30%% prediction set plus a combined scored sheet. Use an empty value to skip.")
+    parser.add_argument("--n-jobs", type=int, default=3, help="Number of validation runs to execute simultaneously. Use 1 to run serially. Default: 3")
     parser.add_argument("--cv-repeats", type=int, default=10, help="Number of repeated grouped 70/30 validations to run for all-inclusive metrics. Default: 10")
     parser.add_argument("--cv-folds", type=int, default=5, help="Number of grouped cross-validation folds to run for all-inclusive metrics. Default: 5")
     parser.add_argument("--high-threshold", type=float, default=HIGH_CONFIDENCE_THRESHOLD)
@@ -205,6 +209,10 @@ def main():
     args = parser.parse_args()
     if not 0.0485 <= args.train_size <= 0.95:
         raise ValueError("--train-size must be between 0.0485 and 0.95")
+    if args.rotation_runs < 0:
+        raise ValueError("--rotation-runs must be 0 or greater")
+    if args.n_jobs == 0:
+        raise ValueError("--n-jobs must be non-zero; use 1 for serial execution or -1 for all cores")
     df = clean_df(read_source(args.input))
     X = build_text(df)
     mandatory = df["Decision"].isin(MANDATORY_DECISIONS).to_numpy()
@@ -260,10 +268,12 @@ def main():
         "heldout_tier_counts": test_summary.get("tier_counts", {}),
         "nonmandatory_model_only": holdout["nonmandatory_model_only"],
     }
-    repeated_runs = []
-    if args.cv_repeats > 0:
-        repeated_splitter = GroupShuffleSplit(n_splits=args.cv_repeats, train_size=args.train_size, random_state=args.random_state)
-        for run_number, (cv_train_idx, cv_test_idx) in enumerate(repeated_splitter.split(X, y_corrected, groups=groups), start=1):
+    rotation_runs = []
+    if args.rotation_runs > 0:
+        rotation_splitter = GroupShuffleSplit(n_splits=args.rotation_runs, train_size=args.train_size, random_state=args.random_state)
+        rotation_splits = list(rotation_splitter.split(X, y_corrected, groups=groups))
+
+        def evaluate_numbered_rotation(run_number: int, cv_train_idx: np.ndarray, cv_test_idx: np.ndarray) -> dict:
             run = evaluate_split(
                 df,
                 X,
@@ -276,7 +286,52 @@ def main():
                 args.watchlist_threshold,
             )
             run["run"] = run_number
-            repeated_runs.append(run)
+            return run
+
+        rotation_runs = Parallel(n_jobs=args.n_jobs, prefer="threads")(
+            delayed(evaluate_numbered_rotation)(run_number, cv_train_idx, cv_test_idx)
+            for run_number, (cv_train_idx, cv_test_idx) in enumerate(rotation_splits, start=1)
+        )
+    metrics["rotated_grouped_holdouts"] = {
+        "method": f"{args.rotation_runs} simultaneous rotated grouped 70/30 holdouts by {args.group_column}",
+        "train_size_requested": float(args.train_size),
+        "n_jobs": int(args.n_jobs),
+        **aggregate_validation_runs(rotation_runs, groups),
+    }
+    if args.rotation_output and rotation_runs:
+        combined_scored = []
+        with pd.ExcelWriter(args.rotation_output) as writer:
+            for run in rotation_runs:
+                run_scored = run["scored_test"].copy()
+                run_scored.insert(0, "Validation Rotation", run["run"])
+                run_scored.to_excel(writer, sheet_name=f"rotation_{run['run']}", index=False)
+                combined_scored.append(run_scored)
+            pd.concat(combined_scored, ignore_index=True).to_excel(writer, sheet_name="combined", index=False)
+
+    repeated_runs = []
+    if args.cv_repeats > 0:
+        repeated_splitter = GroupShuffleSplit(n_splits=args.cv_repeats, train_size=args.train_size, random_state=args.random_state)
+        repeated_splits = list(repeated_splitter.split(X, y_corrected, groups=groups))
+
+        def evaluate_numbered_repeat(run_number: int, cv_train_idx: np.ndarray, cv_test_idx: np.ndarray) -> dict:
+            run = evaluate_split(
+                df,
+                X,
+                y_hist,
+                mandatory,
+                cv_train_idx,
+                cv_test_idx,
+                args.random_state + 100 + run_number,
+                args.high_threshold,
+                args.watchlist_threshold,
+            )
+            run["run"] = run_number
+            return run
+
+        repeated_runs = Parallel(n_jobs=args.n_jobs, prefer="threads")(
+            delayed(evaluate_numbered_repeat)(run_number, cv_train_idx, cv_test_idx)
+            for run_number, (cv_train_idx, cv_test_idx) in enumerate(repeated_splits, start=1)
+        )
     metrics["repeated_grouped_holdout"] = {
         "method": f"{args.cv_repeats} repeated grouped holdouts by {args.group_column}",
         "train_size_requested": float(args.train_size),

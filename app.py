@@ -1,36 +1,67 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 from design_assessment_engine import (
     read_input_file,
     score_dataframe,
     load_model,
     to_excel_bytes,
     summarize_scored,
+    clean_df,
+    build_text,
+    MANDATORY_DECISIONS,
     HIGH_CONFIDENCE_THRESHOLD,
     WATCHLIST_THRESHOLD,
 )
+from sklearn.model_selection import GroupShuffleSplit
+from joblib import Parallel, delayed
+from train_model import evaluate_split, make_groups, aggregate_validation_runs
 
 st.set_page_config(page_title="Design Assessment Tiered Screener", layout="wide")
 st.title("Design Assessment Tiered Screener")
 st.caption("Mandatory rule: Death - Reportable or Serious Injury - Reportable is always DA REQUIRED, even if prior history did not include a DA task.")
 
-payload = load_model("design_assessment_model.joblib")
-metrics = payload.get("metrics", {})
 
-with st.sidebar:
-    st.header("Tier rules")
-    high_threshold = st.slider("High-confidence model threshold", 0.01, 0.99, float(payload.get("high_confidence_threshold", payload.get("high_threshold", HIGH_CONFIDENCE_THRESHOLD))), 0.01)
-    watch_threshold = st.slider("Watchlist model threshold", 0.01, 0.50, float(payload.get("watchlist_threshold", payload.get("review_threshold", WATCHLIST_THRESHOLD))), 0.01)
-    st.markdown("**DA REQUIRED**: Death - Reportable or Serious Injury - Reportable")
-    st.markdown("**DA REVIEW - HIGH CONFIDENCE**: model probability above high-confidence threshold")
-    st.markdown("**DA WATCHLIST - LOW CONFIDENCE**: definition signal or model probability above watchlist threshold")
-    st.warning("This is a triage tool. Final DA disposition should stay with the quality/design reviewer.")
+def _format_pct(value):
+    if value is None:
+        return ""
+    return f"{float(value):.1%}"
 
-uploaded = st.file_uploader("Upload a new Excel or CSV file to score", type=["xlsx", "xls", "csv"])
-if uploaded is None:
-    st.info("Upload a file with the same columns as the historical extract, including Decision.")
-    if metrics:
-        st.subheader("Current model validation")
+def _scorecard_row(label: str, scorecard: dict) -> dict:
+    return {
+        "Validation set": label,
+        "Accuracy": _format_pct(scorecard.get("accuracy")),
+        "Precision": _format_pct(scorecard.get("precision")),
+        "Recall": _format_pct(scorecard.get("recall")),
+        "F1": _format_pct(scorecard.get("f1")),
+        "TP": scorecard.get("tp", 0),
+        "FP": scorecard.get("fp", 0),
+        "FN": scorecard.get("fn", 0),
+        "TN": scorecard.get("tn", 0),
+    }
+
+def _combined_scorecard_row(label: str, section: dict, scorecard_name: str) -> dict | None:
+    scorecard = section.get(scorecard_name, {})
+    total_counts = scorecard.get("total_counts", {})
+    if not total_counts:
+        return None
+    return {
+        "Validation set": label,
+        "Accuracy": _format_pct(scorecard.get("accuracy", {}).get("mean")),
+        "Precision": _format_pct(scorecard.get("precision", {}).get("mean")),
+        "Recall": _format_pct(scorecard.get("recall", {}).get("mean")),
+        "F1": _format_pct(scorecard.get("f1", {}).get("mean")),
+        "TP": total_counts.get("tp", 0),
+        "FP": total_counts.get("fp", 0),
+        "FN": total_counts.get("fn", 0),
+        "TN": total_counts.get("tn", 0),
+    }
+
+def show_validation_results(metrics: dict) -> None:
+    if not metrics:
+        return
+
+    with st.expander("Current model validation results", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Train rows", f"{metrics.get('train_rows', metrics.get('training_rows', 0)):,}")
         c2.metric("Test rows", f"{metrics.get('test_rows', metrics.get('validation_rows', 0)):,}")
@@ -44,7 +75,120 @@ if uploaded is None:
             v2.metric("Holdout precision", f"{holdout.get('precision', 0):.1%}")
             v3.metric("Holdout recall", f"{holdout.get('recall', 0):.1%}")
             v4.metric("Holdout false negatives", f"{holdout.get('fn', 0):,}")
-            st.caption(metrics.get("validation_method", "Validation metrics"))
+
+        rows = []
+        if holdout:
+            rows.append(_scorecard_row("Primary holdout", holdout))
+
+        validation_section = metrics.get("rotated_grouped_holdouts", {})
+        run_label = "Rotation"
+        combined_label = "Rotations combined"
+        if not validation_section.get("run_details"):
+            validation_section = metrics.get("repeated_grouped_holdout", {})
+            run_label = "Repeated holdout"
+            combined_label = "Repeated holdouts combined"
+
+        for run in validation_section.get("run_details", []):
+            rows.append(_scorecard_row(f"{run_label} {run.get('run')}", run.get("review_queue_scorecard", {})))
+        combined = _combined_scorecard_row(combined_label, validation_section, "review_queue_scorecard")
+        if combined:
+            rows.append(combined)
+
+        if rows:
+            st.markdown("**Review queue validation by set**")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            if run_label != "Rotation":
+                st.info("Retrain with the latest `train_model.py` to populate the 3 rotated 70/30 validation rows. Showing repeated holdout runs from the current saved model until then.")
+
+        st.caption(metrics.get("validation_method", "Validation metrics"))
+
+@st.cache_data(show_spinner=False)
+def run_uploaded_rotated_validation(
+    raw_df: pd.DataFrame,
+    high_threshold: float,
+    watch_threshold: float,
+    train_size: float = 0.70,
+    random_state: int = 42,
+    group_column: str = "PE - PLI #",
+    rotation_runs: int = 3,
+    n_jobs: int = 3,
+) -> tuple[list[dict], dict]:
+    df = clean_df(raw_df)
+    groups = make_groups(df, group_column)
+    if len(pd.unique(groups)) < 2:
+        raise ValueError(f"{group_column!r} must produce at least two groups")
+
+    X = build_text(df)
+    mandatory = df["Decision"].isin(MANDATORY_DECISIONS).to_numpy()
+    y_hist = (df["Type - PE PLI Task"].str.lower() == "design assessment").astype(int).to_numpy()
+    y_corrected = np.where(mandatory, 1, y_hist).astype(int)
+    splitter = GroupShuffleSplit(n_splits=rotation_runs, train_size=train_size, random_state=random_state)
+    splits = list(splitter.split(X, y_corrected, groups=groups))
+
+    def run_rotation(run_number: int, train_idx, test_idx) -> dict:
+        run = evaluate_split(
+            df,
+            X,
+            y_hist,
+            mandatory,
+            train_idx,
+            test_idx,
+            random_state + run_number,
+            high_threshold,
+            watch_threshold,
+        )
+        run["run"] = run_number
+        return run
+
+    runs = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(run_rotation)(run_number, train_idx, test_idx)
+        for run_number, (train_idx, test_idx) in enumerate(splits, start=1)
+    )
+    summary = aggregate_validation_runs(runs, groups)
+    rows = [
+        _scorecard_row(f"Uploaded rotation {run.get('run')}", run.get("test_summary", {}).get("review_queue_scorecard", {}))
+        for run in runs
+    ]
+    combined = _combined_scorecard_row("Uploaded rotations combined", summary, "review_queue_scorecard")
+    if combined:
+        rows.append(combined)
+    return rows, summary
+
+def show_uploaded_rotation_results(df: pd.DataFrame, high_threshold: float, watch_threshold: float) -> None:
+    if "Decision" not in df.columns or "Type - PE PLI Task" not in df.columns:
+        st.info("Upload includes no validation labels, so rotated validation cannot be calculated for this file.")
+        return
+
+    try:
+        with st.spinner("Running 3 rotated 70/30 validations on the uploaded file..."):
+            rows, _summary = run_uploaded_rotated_validation(df, high_threshold, watch_threshold)
+    except Exception as e:
+        st.warning(f"Could not calculate uploaded-file rotated validation: {e}")
+        return
+
+    if rows:
+        st.subheader("Uploaded file rotated 70/30 validation")
+        st.caption("Each row trains on a random grouped 70% of the uploaded file and predicts a different grouped 30%; the combined row summarizes all three prediction sets.")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+payload = load_model("design_assessment_model.joblib")
+metrics = payload.get("metrics", {})
+
+with st.sidebar:
+    st.header("Tier rules")
+    high_threshold = st.slider("High-confidence model threshold", 0.01, 0.99, float(payload.get("high_confidence_threshold", payload.get("high_threshold", HIGH_CONFIDENCE_THRESHOLD))), 0.01)
+    watch_threshold = st.slider("Watchlist model threshold", 0.01, 0.50, float(payload.get("watchlist_threshold", payload.get("review_threshold", WATCHLIST_THRESHOLD))), 0.01)
+    st.markdown("**DA REQUIRED**: Death - Reportable or Serious Injury - Reportable")
+    st.markdown("**DA REVIEW - HIGH CONFIDENCE**: model probability above high-confidence threshold")
+    st.markdown("**DA WATCHLIST - LOW CONFIDENCE**: definition signal or model probability above watchlist threshold")
+    st.warning("This is a triage tool. Final DA disposition should stay with the quality/design reviewer.")
+
+show_validation_results(metrics)
+
+uploaded = st.file_uploader("Upload a new Excel or CSV file to score", type=["xlsx", "xls", "csv"])
+if uploaded is None:
+    st.info("Upload a file with the same columns as the historical extract, including Decision.")
     st.stop()
 
 try:
@@ -56,6 +200,7 @@ except Exception as e:
 
 summary = summarize_scored(scored)
 st.success(f"Scored {len(scored):,} rows")
+show_uploaded_rotation_results(df, high_threshold, watch_threshold)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("DA REQUIRED", f"{summary['tier_counts'].get('DA REQUIRED', 0):,}")

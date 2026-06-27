@@ -1,3 +1,26 @@
+# Assessment Tiered Screener
+
+The Streamlit application now has two tabs:
+
+- **Design Assessment** — the existing Design Assessment triage workflow is preserved as-is.
+- **Manufacturing Assessment** — a new deterministic model identifies potential manufacturing issues based on the provided Medtronic definition.
+
+## Manufacturing Assessment tab
+
+The Manufacturing Assessment model flags potential manufacturing issues where an aspect of the manufacturing process may have contributed to the device issue, including external supplier manufacturing processes. It looks for definition signals including sterile packaging compromise, foreign material inside a sterile package, missing/damaged/detached package contents, labeling issues, out-of-box failures, supplier/assembly/process language, and prior manufacturing-related Further Action or Investigation language.
+
+Batch score a file for Manufacturing Assessment:
+
+```bash
+python score_manufacturing_file.py "input.xlsx" --output "manufacturing_assessment_scored.xlsx"
+```
+
+Optional threshold:
+
+```bash
+python score_manufacturing_file.py "input.xlsx" --review-threshold 0.50 --output "manufacturing_assessment_scored.xlsx"
+```
+
 # Design Assessment Tiered Screener
 
 This package scores Medtronic-style Product Event / PLI extracts for Design Assessment triage.
